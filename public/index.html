@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>High-Precision Music Event Bridge</title>
+  <link rel="stylesheet" href="/public/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>High-precision music event bridge</h1>
+      <p class="sub">UMP / MIDI 2.0 subset &harr; internal identity-preserving events &rarr; configurable sink</p>
+    </div>
+    <div class="status" id="status-pill">idle</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls" aria-label="High-precision event controls">
+      <h2>Event source</h2>
+
+      <fieldset>
+        <legend>Protocol mode</legend>
+        <label><input type="radio" name="mode" value="ump-midi2" checked /> UMP / MIDI 2.0 (16/32-bit)</label>
+        <label><input type="radio" name="mode" value="ump-midi1" /> UMP / MIDI 1.0 (7-bit)</label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Note</legend>
+        <div class="grid3">
+          <label>Group <input id="note-group" type="number" min="0" max="15" value="0" /></label>
+          <label>Channel <input id="note-channel" type="number" min="0" max="15" value="0" /></label>
+          <label>Note <input id="note-number" type="number" min="0" max="127" value="60" /></label>
+        </div>
+        <label>Velocity
+          <span class="value" id="vel-readout"></span>
+          <input id="note-velocity" type="range" min="1" max="65535" value="48000" />
+          <input id="note-velocity-exact" type="number" min="1" max="65535" value="48000" />
+        </label>
+        <div class="row">
+          <button id="btn-note-on" class="primary">Press high-res note</button>
+          <button id="btn-note-on-duplicate">Press same key again</button>
+          <button id="btn-note-off">Release by identity</button>
+          <button id="btn-release-note">Release by channel+note</button>
+        </div>
+        <p class="hint">Two presses of the same key carry distinct 16-bit identities (Attribute Type&nbsp;0x01). Release-by-identity ends exactly one of them.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Continuous control</legend>
+        <div class="grid3">
+          <label>Controller <input id="cc-number" type="number" min="0" max="127" value="1" /></label>
+          <label>Pitch-bend <input id="bend-value" type="number" min="0" max="4294967295" value="2147483648" /></label>
+        </div>
+        <label>Controller value (32-bit)
+          <span class="value" id="cc-readout"></span>
+          <input id="cc-value" type="range" min="0" max="4294967295" value="2147483648" />
+          <input id="cc-value-exact" type="number" min="0" max="4294967295" value="2147483648" />
+        </label>
+        <div class="row">
+          <button id="btn-cc">Send controller</button>
+          <button id="btn-sweep">Send fine sweep</button>
+          <button id="btn-bend">Send pitch bend</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Sink (receiver) port</legend>
+        <label>Protocol
+          <select id="sink-protocol">
+            <option value="ump-midi2">UMP / MIDI 2.0 (identity-capable)</option>
+            <option value="ump-midi1">UMP / MIDI 1.0 (7-bit, no identity)</option>
+            <option value="legacy">Legacy channel port (7-bit, no identity)</option>
+          </select>
+        </label>
+        <label>Available channels
+          <input id="sink-channels" type="text" value="0,1,2,3" />
+        </label>
+        <label>No free channel for a new voice
+          <select id="policy-note-conflict">
+            <option value="fold">Fold into one wire voice (loses independent release)</option>
+            <option value="refuse">Refuse the takeover</option>
+          </select>
+        </label>
+        <label>Wide control on 7-bit sink
+          <select id="policy-control">
+            <option value="split">Split to 14-bit (CC n / n+32)</option>
+            <option value="quantise">Quantise to one 7-bit message</option>
+          </select>
+        </label>
+        <div class="row">
+          <button id="btn-apply-sink">Apply sink change (take over sounding notes)</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Fixtures &amp; diagnostics</legend>
+        <div class="row wrap">
+          <button data-fixture="duplicate">Duplicate key</button>
+          <button data-fixture="boundary">Boundary + groups</button>
+          <button data-fixture="crossGroup">Cross-group same note</button>
+          <button data-fixture="mixed">Mixed / unsupported</button>
+          <button id="btn-reset">Reset</button>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="panel results" aria-label="Bridge results">
+      <div class="result-head">
+        <h2>Bridge decisions</h2>
+        <button id="btn-clear" class="ghost">Clear log</button>
+      </div>
+      <div id="alert-area" class="alerts" role="alert" aria-live="assertive"></div>
+      <ol id="decision-log" class="log"></ol>
+
+      <h2>Sound timeline</h2>
+      <div id="timeline" class="timeline"></div>
+
+      <h2>Wire messages</h2>
+      <pre id="wire-out" class="wire"></pre>
+
+      <h2>Precision report</h2>
+      <div id="precision" class="precision"></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Graphical entry point: <code>npm start</code> then this page. CLI is auxiliary: <code>node src/cli.js --help</code>.</span>
+    <span id="policy-line"></span>
+  </footer>
+
+  <script type="module" src="/public/app.js"></script>
+</body>
+</html>

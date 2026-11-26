@@ -1,0 +1,16 @@
+{
+  "name": "high-precision-music-event-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "High-precision UMP/MIDI 2.0 event bridge with identity-preserving note allocation, precision-aware channel fallback, and a graphical control panel.",
+  "scripts": {
+    "start": "node scripts/serve.js",
+    "serve": "node scripts/serve.js",
+    "cli": "node src/cli.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
