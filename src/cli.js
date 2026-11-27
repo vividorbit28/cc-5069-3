@@ -12,6 +12,8 @@
 //   node src/cli.js scenario [--channels 0,1,2,3] [--note-conflict fold|refuse]
 //   node src/cli.js fixtures
 //   node src/cli.js policy
+//   node src/cli.js degrade
+//   node src/cli.js compare
 //   node src/cli.js serve            # prints the graphical entry point
 //
 // It does not print raw decimals as a substitute for decoding: every value is
@@ -25,6 +27,8 @@ import { uintToUnit, unitToUint, compareLevel, policySummary, PROTOCOLS, maxForB
 import { runSwitchScenario } from './core/scenario.js';
 import { allFixtures } from './core/fixtures.js';
 import { decodeUmp } from './core/ump.js';
+import { degradationCatalogue, DISPOSITION } from './core/degradation.js';
+import { compareDegradationStrategies } from './core/comparison.js';
 
 const BOOLEAN_FLAGS = new Set(['json']);
 
@@ -193,6 +197,45 @@ function cmdPolicy() {
   }
 }
 
+function cmdDegrade(args) {
+  const catalogue = degradationCatalogue();
+  if (args.json) {
+    console.log(JSON.stringify(catalogue, null, 2));
+    return;
+  }
+  console.log('endpoint degradation matrix (real carriers only, no private fields):');
+  for (const row of catalogue) {
+    const disposition = row.staticDisposition ?? 'resolved live (extra-channel / approximate / refuse)';
+    const alt = row.altCarrier ? ` or ${row.altCarrier} (${row.altBits ?? '?'}bit)` : '';
+    console.log(`  ${row.type}${row.perNote ? ' [per-note]' : ''} -> ${row.endpoint}: ${disposition} via ${row.carrier} (${row.bits}bit)${alt}`);
+  }
+  console.log('\ndispositions:');
+  for (const [k, v] of Object.entries(DISPOSITION)) console.log(`  ${v}: ${dispositionHelp(v)}`);
+}
+
+function dispositionHelp(v) {
+  return {
+    [DISPOSITION.CHANNEL]: 'a real channel carrier exists; delivered after quantisation',
+    [DISPOSITION.APPROXIMATE]: 'a channel-wide message stands in and moves other voices too (destructive)',
+    [DISPOSITION.EXTRA_CHANNEL]: 'only recoverable by moving the note onto its own channel',
+    [DISPOSITION.REFUSE]: 'no carrier can express it; rejected with a reason, never hidden',
+  }[v];
+}
+
+function cmdCompare(args) {
+  const channels = args.channels ? String(args.channels).split(',').map((x) => Number.parseInt(x.trim(), 10)) : [0, 1, 2];
+  const bendUnit = args.bend ? Number(args.bend) : 0.625;
+  const r = compareDegradationStrategies({ channels, bendUnit });
+  console.log(`situation: two notes share a channel, per-note bend ${bendUnit}, channels [${channels.join(', ')}]`);
+  for (const row of r.contrast) {
+    console.log(`\n${row.axis}:`);
+    console.log(`  migrate-note:    ${row.migrateNote}`);
+    console.log(`  staged-degrade:  ${row.stagedDegrade}`);
+  }
+  console.log(`\nrecommendation: ${r.recommendation}`);
+  if (args.json) console.log(JSON.stringify(r, null, 2));
+}
+
 function cmdServe() {
   console.log('Graphical entry point for high-precision events:');
   console.log('  npm start');
@@ -210,6 +253,9 @@ function usage() {
                                    run the duplicate-key switch acceptance scenarios
   fixtures                         decode the boundary / multi-group / mixed fixtures
   policy                           print the fixed mapping policy and capabilities
+  degrade                          print the per-control endpoint degradation matrix
+  compare [--channels a,b,c] [--bend 0.625]
+                                   compare migrate-note vs staged-degrade on a shared channel
   serve                            print the graphical entry point
 
 Fields for encode: --channel --note --velocity --controller --value --note-id --group
@@ -227,6 +273,8 @@ function main() {
       case 'scenario': return cmdScenario(args);
       case 'fixtures': return cmdFixtures();
       case 'policy': return cmdPolicy();
+      case 'degrade': return cmdDegrade(args);
+      case 'compare': return cmdCompare(args);
       case 'serve': return cmdServe();
       case 'help': case '--help': case '-h': return usage();
       default:

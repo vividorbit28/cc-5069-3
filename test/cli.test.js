@@ -48,3 +48,20 @@ test('cli decode reports unsupported message types as rejections', () => {
   assert.match(out, /unsupported/);
   assert.match(out, /Message type 0x1/);
 });
+
+test('cli degrade prints the per-control disposition matrix', () => {
+  const out = run(['degrade']);
+  assert.match(out, /endpoint degradation matrix/);
+  assert.match(out, /perNotePitchBend/);
+  assert.match(out, /midi1-poly-pressure-7bit/);
+  assert.match(out, /extra-channel/);
+  assert.match(out, /refuse/);
+});
+
+test('cli compare reports both strategies and their measured trade-off', () => {
+  const out = run(['compare', '--channels', '0,1,2']);
+  assert.match(out, /migrate-note/);
+  assert.match(out, /staged-degrade/);
+  assert.match(out, /retriggers/);
+  assert.match(out, /wire balance/);
+});

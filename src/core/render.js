@@ -24,6 +24,7 @@ export function parseOutput(output) {
   if (kind === 0x90) return { type: bytes[2] > 0 ? 'noteOn' : 'noteOff', channel, note: bytes[1] & 0x7f, velocity: bytes[2] & 0x7f, group, port: output.protocol };
   if (kind === 0x80) return { type: 'noteOff', channel, note: bytes[1] & 0x7f, velocity: bytes[2] & 0x7f, group, port: output.protocol };
   if (kind === 0xb0) return { type: 'controlChange', channel, controller: bytes[1] & 0x7f, value: bytes[2] & 0x7f, group, port: output.protocol };
+  if (kind === 0xa0) return { type: 'polyPressure', channel, note: bytes[1] & 0x7f, value: bytes[2] & 0x7f, group, port: output.protocol };
   if (kind === 0xe0) return { type: 'pitchBend', channel, value: (bytes[2] & 0x7f) * 128 + (bytes[1] & 0x7f), group, port: output.protocol };
   if (kind === 0xd0) return { type: 'channelPressure', channel, value: bytes[1] & 0x7f, group, port: output.protocol };
   if (status === 0xf0) return { type: 'sysex', data: bytes.slice(1, -1), group, port: output.protocol };

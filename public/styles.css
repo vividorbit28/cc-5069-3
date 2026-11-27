@@ -201,3 +201,15 @@ button.ghost { background: transparent; color: var(--muted); padding: 4px 9px; }
   font-size: 12px;
 }
 code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+
+.degradation { display: flex; flex-direction: column; gap: 14px; }
+.diag-block h3 { font-size: 13px; margin: 0 0 6px; color: var(--text); }
+.diag-block table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+.diag-block th, .diag-block td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.diag-block th { color: var(--muted); font-weight: 600; }
+.diag-block tr.loss-destructive td { color: var(--bad); }
+.diag-block tr.loss-approx td { color: var(--warn); }
+.compare-box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel-2); }
+.compare-box h3 { font-size: 13px; margin: 0 0 8px; }
+.compare-box table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+.compare-box th, .compare-box td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }

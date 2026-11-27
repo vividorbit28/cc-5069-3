@@ -135,12 +135,13 @@ test('a 14-bit split preserves a control change a 7-bit quantise cannot', () => 
   assert.notEqual(sb.outputs[1].hex, '0xB0 0x21 0x00', '14-bit LSB moves');
 });
 
-test('per-note controls on an identity-less sink are dropped with a preserved reason', () => {
+test('per-note controls on an identity-less sink are refused with a preserved reason', () => {
   const b = createBridge({ sink: { protocol: 'legacy', availableChannels: [0] } });
   const r = b.handle(ev(encodeUmp({ type: 'perNotePitchBend', channel: 0, note: 60, value: 0x80000000 })));
-  assert.equal(r.decision, 'perNotePitchBend-dropped');
+  assert.equal(r.decision, 'perNotePitchBend-refused');
   assert.equal(r.outputs.length, 0);
-  assert.ok(r.losses.some((l) => l.quantisable === false && /per-note identity/.test(l.note)));
+  assert.ok(r.losses.some((l) => l.quantisable === false && l.disposition === 'refuse'));
+  assert.ok(b.diagnostics().byKind('refusal').length >= 1);
 });
 
 test('per-note pitch bend reaches an identity sink unchanged', () => {

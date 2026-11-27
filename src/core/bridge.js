@@ -21,6 +21,11 @@
 
 import { encodeUmp, toHex } from './ump.js';
 import { PROTOCOLS, compareLevel, unitToUint, maxForBits } from './precision.js';
+import {
+  DISPOSITION, resolvePerNoteDisposition, controlRule, recomputeBendError, quantiseField,
+} from './degradation.js';
+import { createDiagnostics } from './diagnostics.js';
+import { createLoopGuard } from './loopguard.js';
 
 export const DEFAULT_POLICY = Object.freeze({
   // What to do with a new voice of a note when no channel is free for it.
@@ -30,7 +35,12 @@ export const DEFAULT_POLICY = Object.freeze({
   // event budget; if the budget is spent it falls back to quantise.
   controlResolution: 'split', // 'split' | 'quantise'
   // Per-note pressure / per-note pitch bend on a sink with no note identity.
-  perNoteControl: 'drop', // 'drop' | 'channel-approximate'
+  //   'drop'                 refuse the event, keep the reason;
+  //   'channel-approximate'  bend the whole channel (moves other voices too);
+  //   'migrate-note'         move the note to a dedicated channel first;
+  //   'staged-degrade'       keep the note in place, defer the bend until the
+  //                          note can be isolated at its release.
+  perNoteControl: 'drop', // 'drop' | 'channel-approximate' | 'migrate-note' | 'staged-degrade'
   maxExtraEventsPerInput: 1,
 });
 
@@ -58,9 +68,11 @@ function normalizeSink(config) {
 
 const noteKey = (channel, note) => `${channel}:${note}`;
 
-export function createBridge({ sink, policy = {} } = {}) {
+export function createBridge({ sink, policy = {}, bridgeId = 'bridge-1' } = {}) {
   if (!sink) throw new Error('createBridge: a sink is required');
   const mergedPolicy = { ...DEFAULT_POLICY, ...policy };
+  const diagnostics = createDiagnostics();
+  const loopGuard = createLoopGuard({ bridgeId: policy.bridgeId ?? bridgeId });
   const state = {
     policy: mergedPolicy,
     sink: normalizeSink(sink),
@@ -70,6 +82,13 @@ export function createBridge({ sink, policy = {} } = {}) {
     onOrder: 0,
     trace: [],
     traceSeq: 0,
+    // Per-note expression that must follow the note across channel moves:
+    // noteId -> { perNotePitchBend: {valueUnit, valueRaw} | null, polyPressure: ... }
+    expression: new Map(),
+    // Expression withheld by the staged policy, keyed by noteId.
+    deferred: new Map(),
+    diagnostics,
+    loopGuard,
   };
 
   function record(entry) {
@@ -183,6 +202,8 @@ export function createBridge({ sink, policy = {} } = {}) {
     return out;
   }
 
+  // Initial allocation: different notes share a channel freely, so only a
+  // channel already hosting the same note number is busy.
   function findFreeChannel(note) {
     const busy = new Set(
       [...state.sink.wireVoices.values()]
@@ -190,6 +211,22 @@ export function createBridge({ sink, policy = {} } = {}) {
         .map((v) => v.channel),
     );
     // Prefer the source channel, then the rest of the sink's channels.
+    const order = [note.channel, ...state.sink.availableChannels.filter((c) => c !== note.channel)];
+    for (const ch of order) {
+      if (!state.sink.availableChannels.includes(ch)) continue;
+      if (!busy.has(ch)) return ch;
+    }
+    return null;
+  }
+
+  // Isolation allocation for per-note expression: the target channel must
+  // carry no wire voice at all, so a channel-wide bend reaches only this note.
+  function findIsolatedChannel(note) {
+    const busy = new Set(
+      [...state.sink.wireVoices.values()]
+        .filter((v) => v.channel != null)
+        .map((v) => v.channel),
+    );
     const order = [note.channel, ...state.sink.availableChannels.filter((c) => c !== note.channel)];
     for (const ch of order) {
       if (!state.sink.availableChannels.includes(ch)) continue;
@@ -215,6 +252,142 @@ export function createBridge({ sink, policy = {} } = {}) {
       if (other.group === note.group && other.note === note.note) return true;
     }
     return false;
+  }
+
+  // A note is isolated when its wire channel carries no other sounding voice.
+  // On an isolated channel a channel-wide bend reaches exactly this note.
+  function isIsolated(note) {
+    const ch = note.route?.channel;
+    if (ch == null) return false;
+    for (const other of state.notes.values()) {
+      if (other.noteId === note.noteId || other.state !== 'sounding') continue;
+      if (other.route.kind === 'rejected') continue;
+      if (other.group === note.group && other.route.channel === ch) return false;
+    }
+    return true;
+  }
+
+  function findSoundingNoteForEvent(event) {
+    if (event.sourceNoteId != null) {
+      const id = state.identityBySource.get(`${event.group}:${event.sourceNoteId}`);
+      const n = id != null ? state.notes.get(id) : null;
+      if (n && n.state === 'sounding') return n;
+    }
+    let oldest = null;
+    for (const n of state.notes.values()) {
+      if (n.state !== 'sounding' || n.route.kind === 'rejected') continue;
+      if (n.group !== event.group || n.note !== event.note) continue;
+      if (!oldest || n.onOrder < oldest.onOrder) oldest = n;
+    }
+    return oldest;
+  }
+
+  function freeChannelExists(note) {
+    return findIsolatedChannel(note) !== null;
+  }
+
+  // Moves one sounding, routed note onto a free channel. The old wire voice is
+  // closed with its own Note Off before the new one opens, so the renderer can
+  // never see a dangling voice, and the internal instance id is unchanged —
+  // that is what lets the later release settle the migrated voice.
+  function migrateNote(note, reason) {
+    const sink = state.sink;
+    const p = PROTOCOLS[sink.protocol];
+    const oldRoute = note.route;
+    const outputs = [];
+    const losses = [];
+    if (oldRoute.kind === 'channel' || oldRoute.kind === 'folded') {
+      const oldVoice = sink.wireVoices.get(oldRoute.wireKey);
+      if (oldVoice) {
+        const representative = state.notes.get(oldVoice.primary) ?? note;
+        outputs.push(noteOffOutput(representative, oldVoice.channel, p.velocityBits));
+        if (oldRoute.kind === 'folded') {
+          // Unfolding: the remaining folded members stay on the old voice.
+          oldVoice.refcount -= 1;
+          oldVoice.members = oldVoice.members.filter((id) => id !== note.noteId);
+          if (oldVoice.refcount <= 0) sink.wireVoices.delete(oldRoute.wireKey);
+        } else {
+          sink.wireVoices.delete(oldRoute.wireKey);
+        }
+      }
+    }
+    const channel = findIsolatedChannel(note);
+    if (channel == null) {
+      return { ok: false, outputs, losses, reason: 'no-free-channel' };
+    }
+    const key = noteKey(channel, note.note);
+    sink.wireVoices.set(key, {
+      kind: 'channel', group: note.group, channel, note: note.note,
+      refcount: 1, members: [note.noteId], primary: note.noteId, foldedCount: 0,
+    });
+    outputs.push(noteOnOutput(note, channel, p.velocityBits));
+    note.route = { kind: 'channel', wireKey: key, channel, wireId: null };
+    const velCmp = compareLevel(note.velocityUnit, p.velocityBits);
+    losses.push({
+      field: 'velocity', fromBits: note.sourcePrecision.velocityBits, toBits: p.velocityBits,
+      intended: note.velocityUnit, delivered: velCmp.delivered, error: velCmp.error, quantisable: true,
+      note: `re-triggered on migration channel ${channel}; velocity re-quantised`,
+    });
+    state.diagnostics.migration({
+      noteId: note.noteId, group: note.group, note: note.note,
+      fromChannel: oldRoute.channel ?? null, toChannel: channel, reason,
+    });
+    record({ noteId: note.noteId, action: 'note-migrate', wireKey: key, detail: `ch${oldRoute.channel ?? '?'}->ch${channel}: ${reason}` });
+    return { ok: true, outputs, losses, channel, wireKey: key };
+  }
+
+  function saveBendExpression(noteId, event) {
+    const expr = state.expression.get(noteId) ?? { perNotePitchBend: null, polyPressure: [] };
+    expr.perNotePitchBend = { valueUnit: event.valueUnit, valueRaw: event.valueRaw };
+    state.expression.set(noteId, expr);
+  }
+
+  // Re-evaluates withheld per-note expression. A deferred bend becomes a real
+  // channel bend as soon as its note is isolated; bends whose note ended first
+  // are closed as documented, never-sounded losses.
+  function flushDeferred(exceptNoteId = null) {
+    const outputs = [];
+    const losses = [];
+    const pitchErrors = [];
+    for (const [noteId, item] of [...state.deferred.entries()]) {
+      if (noteId === exceptNoteId) continue;
+      const note = state.notes.get(noteId);
+      if (!note || note.state !== 'sounding' || note.route.kind === 'rejected') {
+        state.diagnostics.refusal({ noteId, field: 'perNotePitchBend', reason: 'note released before it could be isolated; withheld per-note bend never sounded', disposition: DISPOSITION.REFUSE });
+        state.deferred.delete(noteId);
+        losses.push({ field: 'perNotePitchBend', fromBits: 32, toBits: 0, intended: item.event.valueUnit, delivered: null, error: null, quantisable: false, note: 'staged bend expired at note release without an isolated channel' });
+        continue;
+      }
+      if (isIsolated(note)) {
+        const applied = emitChannelBend(note, item.event);
+        outputs.push(...applied.outputs);
+        losses.push(...applied.losses);
+        pitchErrors.push(applied.pitchError);
+        state.deferred.delete(noteId);
+        record({ noteId, action: 'deferred-bend-applied', wireKey: note.route.wireKey, detail: `isolation achieved; bend delivered on ch${note.route.channel}` });
+      }
+    }
+    return { outputs, losses, pitchErrors };
+  }
+
+  // Encodes a per-note bend as a channel bend on the note's current channel.
+  function emitChannelBend(note, event) {
+    const sink = state.sink;
+    const channels = [note.route.channel];
+    const code14 = unitToUint(event.valueUnit, 14);
+    const outputs = channels.map((ch) => pitchBendMessage(sink.protocol, event.group, ch, code14));
+    const pitchError = recomputeBendError(event.valueUnit, { semitoneRange: 2, bits: 14 });
+    state.diagnostics.quantisation({
+      field: 'perNotePitchBend', valueUnit: event.valueUnit, bits: 14,
+      noteId: note.noteId, channel: note.route.channel, carrier: 'midi1-pitchbend-14bit',
+    });
+    const losses = [{
+      field: 'perNotePitchBend', fromBits: 32, toBits: 14,
+      intended: event.valueUnit, delivered: pitchError.deliveredUnit,
+      error: pitchError.unitError, quantisable: true,
+      note: `delivered as a channel bend on isolated ch${note.route.channel}; pitch error ${pitchError.centsError.toFixed(3)} cents`,
+    }];
+    return { outputs, losses, pitchError: { noteId: note.noteId, ...pitchError, channel: note.route.channel } };
   }
 
   // Routes a single sounding note onto the current sink. Returns
@@ -244,10 +417,21 @@ export function createBridge({ sink, policy = {} } = {}) {
     }
 
     const wireBits = p.velocityBits;
-    const channel = findFreeChannel(note);
+    // A voice needs a (channel, note) slot. Prefer the source channel, then
+    // any channel not already hosting this note number; different notes share
+    // a channel freely. Only a same-note collision forces a split / fold.
+    let channel = findFreeChannel(note);
+    const split = sameNoteSounding(note, note.noteId);
+    if (channel === null) {
+      // Every allowed channel already hosts this note; a completely empty
+      // channel can still carry the independent voice on its own.
+      channel = findIsolatedChannel(note);
+    }
     if (channel !== null) {
       const key = noteKey(channel, note.note);
-      const split = sameNoteSounding(note, note.noteId);
+      // A same-note re-press landing on an occupied (other-note) channel folds
+      // into that channel's voice space via a distinct key; different notes
+      // keep distinct keys but share the channel, which is legal polyphony.
       sink.wireVoices.set(key, {
         kind: 'channel', group: note.group, channel, note: note.note,
         refcount: 1, members: [note.noteId], primary: note.noteId, foldedCount: 0,
@@ -262,6 +446,7 @@ export function createBridge({ sink, policy = {} } = {}) {
       };
     }
 
+    // No channel can host the voice: fold into a same-note voice, or refuse.
     const fold = findFoldTarget(note);
     if (fold && state.policy.noteConflict === 'fold') {
       fold.voice.refcount += 1;
@@ -353,6 +538,7 @@ export function createBridge({ sink, policy = {} } = {}) {
       trace: [],
     };
     state.notes.set(noteId, note);
+    state.expression.set(noteId, { perNotePitchBend: null, polyPressure: [] });
     const routed = routeNote(note);
     note.route = routed.route;
     record({ noteId, action: routed.decision, wireKey: routed.route.wireKey ?? null, detail: routed.reason ?? null });
@@ -376,17 +562,34 @@ export function createBridge({ sink, policy = {} } = {}) {
     note.state = 'released';
     const route = note.route;
 
+    // A release changes channel occupancy: deferred per-note expression on the
+    // remaining, still-sounding notes may now be deliverable. The releasing
+    // note's own withheld bend can never sound and is closed as a documented
+    // loss rather than silently dropped.
+    const ownDeferred = state.deferred.get(noteId);
+    state.deferred.delete(noteId);
+    const flush = flushDeferred();
+    const deferredLosses = [...flush.losses];
+    const deferredOutputs = [...flush.outputs];
+    if (ownDeferred) {
+      state.diagnostics.refusal({ noteId, field: 'perNotePitchBend', reason: 'note released before isolation; withheld per-note bend never sounded', disposition: DISPOSITION.REFUSE });
+      deferredLosses.push({ field: 'perNotePitchBend', fromBits: 32, toBits: 0, intended: ownDeferred.event.valueUnit, delivered: null, error: null, quantisable: false, note: 'staged bend expired at note release without an isolated channel' });
+    }
+    state.expression.delete(noteId);
+
     if (route.kind === 'identity') {
       const output = noteOffOutput(note, route.channel, 16);
       state.sink.wireVoices.delete(route.wireKey);
       record({ noteId, action: 'noteOff-identity', wireKey: route.wireKey, detail: null });
-      return buildResult(event, { decision: 'noteOff-identity', outputs: [output], losses: [], route }, { noteIds: [noteId] });
+      const result = buildResult(event, { decision: 'noteOff-identity', outputs: [output, ...deferredOutputs], losses: deferredLosses, route }, { noteIds: [noteId] });
+      attachPitchErrors(result, flush.pitchErrors);
+      return result;
     }
 
     if (route.kind === 'channel' || route.kind === 'folded') {
       const voice = state.sink.wireVoices.get(route.wireKey);
       if (!voice) {
-        return { input: event, decision: 'noteOff-unmatched', outputs: [], losses: [], noteIds: [noteId], rejected: true, reason: 'wire voice no longer exists' };
+        return { input: event, decision: 'noteOff-unmatched', outputs: deferredOutputs, losses: deferredLosses, noteIds: [noteId], rejected: true, reason: 'wire voice no longer exists' };
       }
       voice.refcount -= 1;
       voice.members = voice.members.filter((id) => id !== noteId);
@@ -395,20 +598,30 @@ export function createBridge({ sink, policy = {} } = {}) {
         const losses = [{
           field: 'noteOff', fromBits: 16, toBits: 0, intended: noteId, delivered: null, error: null, quantisable: false,
           note: `release suppressed: wire voice still held by ${voice.members.map((m) => '#' + m).join(', ')} (refcount ${voice.refcount})`,
-        }];
+        }, ...deferredLosses];
         record({ noteId, action: 'noteOff-suppressed', wireKey: route.wireKey, detail: `refcount=${voice.refcount}; residue=still sounding` });
-        return buildResult(event, { decision: 'noteOff-suppressed', outputs: [], losses, route }, { noteIds: [noteId], residue: true });
+        const result = buildResult(event, { decision: 'noteOff-suppressed', outputs: deferredOutputs, losses, route }, { noteIds: [noteId], residue: true });
+        attachPitchErrors(result, flush.pitchErrors);
+        return result;
       }
       const representative = state.notes.get(voice.primary) ?? note;
       const output = noteOffOutput(representative, voice.channel, PROTOCOLS[state.sink.protocol].velocityBits);
       state.sink.wireVoices.delete(route.wireKey);
       record({ noteId, action: 'noteOff-closes-voice', wireKey: route.wireKey, detail: `refcount 0; closes voice opened by #${voice.primary}` });
-      return buildResult(event, { decision: route.kind === 'folded' ? 'noteOff-closes-folded' : 'noteOff', outputs: [output], losses: [], route }, { noteIds: [noteId] });
+      const result = buildResult(event, { decision: route.kind === 'folded' ? 'noteOff-closes-folded' : 'noteOff', outputs: [output, ...deferredOutputs], losses: deferredLosses, route }, { noteIds: [noteId] });
+      attachPitchErrors(result, flush.pitchErrors);
+      return result;
     }
 
     // rejected voice: nothing on the wire to stop.
     record({ noteId, action: 'noteOff-rejected', wireKey: null, detail: 'voice was never taken over by the sink' });
-    return buildResult(event, { decision: 'noteOff-rejected', outputs: [], losses: [], route }, { noteIds: [noteId] });
+    const result = buildResult(event, { decision: 'noteOff-rejected', outputs: deferredOutputs, losses: deferredLosses, route }, { noteIds: [noteId] });
+    attachPitchErrors(result, flush.pitchErrors);
+    return result;
+  }
+
+  function attachPitchErrors(result, pitchErrors) {
+    if (pitchErrors?.length) result.pitchErrors = pitchErrors;
   }
 
   function targetChannelsFor(group, sourceChannel) {
@@ -428,6 +641,19 @@ export function createBridge({ sink, policy = {} } = {}) {
 
     if (wide) {
       const packet = controlPacketBase(event, event.channel);
+      // Keep per-note expression even on a wide sink so a later renegotiation
+      // onto a low-capability endpoint can re-apply and re-quantise it.
+      if (event.type === 'perNotePitchBend') {
+        const note = findSoundingNoteForEvent(event);
+        if (note) saveBendExpression(note.noteId, event);
+      } else if (event.type === 'polyPressure') {
+        const note = findSoundingNoteForEvent(event);
+        if (note) {
+          const expr = state.expression.get(note.noteId) ?? { perNotePitchBend: null, polyPressure: [] };
+          expr.polyPressure.push({ valueUnit: event.valueUnit, code: event.valueRaw });
+          state.expression.set(note.noteId, expr);
+        }
+      }
       // Values are re-emitted at the source integer width exactly.
       return buildResult(event, {
         decision: `${event.type}-wide`,
@@ -464,6 +690,9 @@ export function createBridge({ sink, policy = {} } = {}) {
       }
       const bits = useSplit ? 14 : 7;
       const cmp = compareLevel(event.valueUnit, bits);
+      for (const ch of channels) {
+        state.diagnostics.quantisation({ field: 'controllerValue', valueUnit: event.valueUnit, bits, channel: ch, carrier: useSplit ? controlRule('controlChange', sink.protocol)?.altCarrier : controlRule('controlChange', sink.protocol)?.carrier });
+      }
       losses.push({
         field: 'controllerValue', fromBits: 32, toBits: bits,
         intended: event.valueUnit, delivered: cmp.delivered, error: cmp.error,
@@ -480,39 +709,127 @@ export function createBridge({ sink, policy = {} } = {}) {
       const code14 = unitToUint(event.valueUnit, 14);
       for (const ch of channels) outputs.push(pitchBendMessage(sink.protocol, event.group, ch, code14));
       const cmp = compareLevel(event.valueUnit, 14);
+      for (const ch of channels) {
+        state.diagnostics.quantisation({ field: 'pitchBend', valueUnit: event.valueUnit, bits: 14, channel: ch, carrier: controlRule('pitchBend', sink.protocol)?.carrier });
+      }
       losses.push({ field: 'pitchBend', fromBits: 32, toBits: 14, intended: event.valueUnit, delivered: cmp.delivered, error: cmp.error, quantisable: true, note: 'bend reduced to a 14-bit wheel value' });
       decision = 'pitchBend-quantised-14bit';
     } else if (event.type === 'channelPressure') {
       const code = unitToUint(event.valueUnit, 7);
       for (const ch of channels) outputs.push(channelPressureMessage(sink.protocol, event.group, ch, code));
-      const cmp = compareLevel(event.valueUnit, 7);
-      losses.push({ field: 'channelPressure', fromBits: 32, toBits: 7, intended: event.valueUnit, delivered: cmp.delivered, error: cmp.error, quantisable: true, note: 'channel pressure reduced to 7 bits' });
+      const q = quantiseField(event.valueUnit, 7);
+      state.diagnostics.quantisation({ field: 'channelPressure', valueUnit: event.valueUnit, bits: 7, channel: event.channel, carrier: controlRule('channelPressure', sink.protocol)?.carrier });
+      losses.push({ field: 'channelPressure', fromBits: 32, toBits: 7, intended: event.valueUnit, delivered: q.deliveredUnit, error: q.error, quantisable: true, note: 'channel pressure reduced to 7 bits' });
       decision = 'channelPressure-quantised-7bit';
-    } else {
-      // polyPressure / perNotePitchBend / per-note CC cannot address identity.
-      if (state.policy.perNoteControl === 'channel-approximate' && event.type === 'perNotePitchBend') {
-        // Approximate per-note bend as a channel-wide bend. This necessarily
-        // bends every other voice on the target channel too, so it is reported
-        // as a destructive loss rather than a clean mapping.
-        const code14 = unitToUint(event.valueUnit, 14);
-        for (const ch of channels) outputs.push(pitchBendMessage(sink.protocol, event.group, ch, code14));
-        losses.push({
-          field: 'perNotePitchBend', fromBits: 32, toBits: 14, intended: event.valueUnit, delivered: code14 / 16383, error: Math.abs(code14 / 16383 - event.valueUnit),
-          quantisable: false,
-          note: 'per-note bend approximated as a channel bend; every other voice on the channel is bent too',
-        });
-        decision = 'perNotePitchBend-channel-approximate';
-      } else {
-        losses.push({
-          field: event.type, fromBits: 32, toBits: 0, intended: event.valueUnit ?? null, delivered: null, error: null,
-          quantisable: false,
-          note: 'sink has no per-note identity; per-note control cannot be delivered without changing other notes on the channel',
-        });
-        decision = `${event.type}-dropped`;
+    } else if (event.type === 'polyPressure') {
+      // Native (channel, note) carrier exists on every endpoint, so per-note
+      // pressure maps cleanly — only its width is quantised.
+      const note = findSoundingNoteForEvent(event);
+      const targetChannels = note?.route?.channel != null ? [note.route.channel] : channels;
+      const code = unitToUint(event.valueUnit, 7);
+      for (const ch of targetChannels) outputs.push(polyPressureMessage(sink.protocol, event.group, ch, event.note, code));
+      const q = quantiseField(event.valueUnit, 7);
+      state.diagnostics.quantisation({ field: 'polyPressure', valueUnit: event.valueUnit, bits: 7, noteId: note?.noteId ?? null, channel: targetChannels[0], carrier: controlRule('polyPressure', sink.protocol)?.carrier });
+      if (note) {
+        const expr = state.expression.get(note.noteId) ?? { perNotePitchBend: null, polyPressure: [] };
+        expr.polyPressure.push({ valueUnit: event.valueUnit, code });
+        state.expression.set(note.noteId, expr);
       }
+      losses.push({
+        field: 'polyPressure', fromBits: 32, toBits: 7, intended: event.valueUnit, delivered: q.deliveredUnit,
+        error: q.error, quantisable: true, disposition: DISPOSITION.CHANNEL,
+        note: 'polyphonic key pressure has a native (channel, note) MIDI 1 carrier; only the 7-bit width is lost',
+      });
+      decision = 'polyPressure-channel-7bit';
+    } else {
+      // perNotePitchBend: identity is the hard part, resolved from live state.
+      const result = handlePerNoteBend(event);
+      return buildResult(event, result, { noteIds: result.noteIds ?? [] });
     }
 
     return buildResult(event, { decision, outputs, losses, route: null, extraEvents: extra }, {});
+  }
+
+  function polyPressureMessage(protocol, group, channel, note, value) {
+    if (protocol === 'ump-midi1') {
+      return emitUmp('ump-midi1', group, { type: 'midi1PolyPressure', channel, note, value }, `MIDI1 PolyPressure ch${channel} n${note}=${value}/127`);
+    }
+    return emitMidi1(group, [0xa0 | clampChannel(channel), note & 0x7f, value & 0x7f], `Legacy PolyPressure ch${channel} n${note}=${value}/127`);
+  }
+
+  // Per-note pitch bend against an identity-less endpoint. The disposition is
+  // never assumed: it is resolved from the note's live isolation and the
+  // configured policy, and every branch leaves a diagnostic behind.
+  function handlePerNoteBend(event) {
+    const sink = state.sink;
+    const note = findSoundingNoteForEvent(event);
+    const isolated = note ? isIsolated(note) : false;
+    const freeChannelAvailable = note ? freeChannelExists(note) : false;
+    const resolved = resolvePerNoteDisposition('perNotePitchBend', sink.protocol, {
+      policy: state.policy.perNoteControl, isolated, freeChannelAvailable,
+    });
+    const losses = [];
+    const outputs = [];
+    let pitchErrors = [];
+    let decision;
+    const noteIds = note ? [note.noteId] : [];
+
+    if (note) saveBendExpression(note.noteId, event);
+
+    if (resolved.disposition === DISPOSITION.CHANNEL) {
+      const applied = emitChannelBend(note, event);
+      outputs.push(...applied.outputs);
+      losses.push(...applied.losses);
+      pitchErrors = [applied.pitchError];
+      decision = isolated ? 'perNotePitchBend-isolated-channel' : 'perNotePitchBend-channel';
+    } else if (resolved.disposition === DISPOSITION.EXTRA_CHANNEL && resolved.requiresMigration) {
+      const moved = migrateNote(note, 'per-note pitch bend needs an isolated channel');
+      if (!moved.ok) {
+        state.diagnostics.refusal({ noteId: note.noteId, field: 'perNotePitchBend', reason: moved.reason, disposition: DISPOSITION.REFUSE });
+        losses.push({ field: 'perNotePitchBend', fromBits: 32, toBits: 0, intended: event.valueUnit, delivered: null, error: null, quantisable: false, disposition: DISPOSITION.REFUSE, note: 'migration impossible: no free channel; bend refused rather than bending other notes' });
+        return { decision: 'perNotePitchBend-refused', outputs: [], losses, route: null, noteIds, reason: moved.reason };
+      }
+      outputs.push(...moved.outputs);
+      losses.push(...moved.losses);
+      const applied = emitChannelBend(note, event);
+      outputs.push(...applied.outputs);
+      losses.push(...applied.losses);
+      pitchErrors = [applied.pitchError];
+      decision = 'perNotePitchBend-migrated';
+    } else if (resolved.deferred) {
+      state.deferred.set(note.noteId, { event, since: state.onOrder });
+      state.diagnostics.deferred({ noteId: note.noteId, field: 'perNotePitchBend', valueUnit: event.valueUnit, reason: resolved.reason });
+      // Another voice may already have ended, opening isolation: re-evaluate.
+      const flush = flushDeferred();
+      outputs.push(...flush.outputs);
+      losses.push(...flush.losses);
+      pitchErrors.push(...flush.pitchErrors);
+      losses.push({ field: 'perNotePitchBend', fromBits: 32, toBits: 14, intended: event.valueUnit, delivered: null, error: null, quantisable: false, disposition: DISPOSITION.APPROXIMATE, note: resolved.reason });
+      decision = 'perNotePitchBend-deferred';
+    } else if (resolved.disposition === DISPOSITION.APPROXIMATE) {
+      const code14 = unitToUint(event.valueUnit, 14);
+      const channels = targetChannelsFor(event.group, event.channel);
+      for (const ch of channels) outputs.push(pitchBendMessage(sink.protocol, event.group, ch, code14));
+      const pitchError = recomputeBendError(event.valueUnit, { semitoneRange: 2, bits: 14 });
+      pitchErrors = [{ noteId: note?.noteId ?? null, ...pitchError, channel: channels[0] }];
+      state.diagnostics.quantisation({ field: 'perNotePitchBend', valueUnit: event.valueUnit, bits: 14, noteId: note?.noteId ?? null, channel: channels[0], carrier: 'midi1-pitchbend-14bit' });
+      losses.push({
+        field: 'perNotePitchBend', fromBits: 32, toBits: 14, intended: event.valueUnit,
+        delivered: pitchError.deliveredUnit, error: pitchError.unitError,
+        quantisable: false, disposition: DISPOSITION.APPROXIMATE,
+        note: `${resolved.reason}; measured pitch error ${pitchError.centsError.toFixed(3)} cents`,
+      });
+      decision = 'perNotePitchBend-channel-approximate';
+    } else {
+      state.diagnostics.refusal({ noteId: note?.noteId ?? null, field: 'perNotePitchBend', reason: resolved.reason, disposition: DISPOSITION.REFUSE });
+      losses.push({
+        field: 'perNotePitchBend', fromBits: 32, toBits: 0, intended: event.valueUnit, delivered: null,
+        error: null, quantisable: false, disposition: DISPOSITION.REFUSE, note: resolved.reason,
+      });
+      decision = 'perNotePitchBend-refused';
+    }
+
+    return { decision, outputs, losses, route: note?.route ?? null, noteIds, pitchErrors, reason: resolved.reason };
   }
 
   function ccMessage(protocol, group, channel, controller, value) {
@@ -595,6 +912,7 @@ export function createBridge({ sink, policy = {} } = {}) {
       residue: extra.residue ?? false,
       rejected: routed.rejected ?? false,
       route: routed.route ?? null,
+      pitchErrors: routed.pitchErrors ?? extra.pitchErrors ?? [],
       extraEvents: routed.extraEvents ?? Math.max(0, outputs.length - 1),
     };
   }
@@ -602,6 +920,11 @@ export function createBridge({ sink, policy = {} } = {}) {
   // ---- public API ----------------------------------------------------------
 
   function handle(event) {
+    const result = dispatch(event);
+    return stampResult(result);
+  }
+
+  function dispatch(event) {
     switch (event.type) {
       case 'noteOn':
         return handleNoteOn(event);
@@ -624,35 +947,133 @@ export function createBridge({ sink, policy = {} } = {}) {
     }
   }
 
-  // Switches the sink and takes over every sounding voice, in original press
-  // order so earlier voices keep priority for scarce channels.
+  // Switches the sink (or shrinks its channel list — a capability
+  // renegotiation) and takes over every sounding voice, in original press
+  // order so earlier voices keep priority for scarce channels. After a voice
+  // is migrated, per-note expression it already held is re-applied on the new
+  // channel and the realised pitch error is recomputed against the new
+  // endpoint width; deferred bends get another chance once the dust settles.
   function setSink(config) {
     const from = state.sink;
+    const channelsRemoved = from.availableChannels
+      .filter((ch) => !(config.availableChannels ?? from.availableChannels).includes(ch));
     const next = normalizeSink(config);
+
+    // Close every wire voice on the endpoint being left before re-routing.
+    // Without this an explicit renegotiation (same protocol, fewer channels)
+    // would strand voices on channels the new endpoint no longer owns — a
+    // dangling note the renderer would never see released.
+    const closureOutputs = [];
+    const oldWireBits = PROTOCOLS[from.protocol].velocityBits;
+    const oldSounding = [...state.notes.values()]
+      .filter((n) => n.state === 'sounding')
+      .sort((a, b) => a.onOrder - b.onOrder);
+    const closedKeys = new Set();
+    for (const note of oldSounding) {
+      const route = note.route;
+      if ((route.kind === 'channel' || route.kind === 'folded') && !closedKeys.has(route.wireKey)) {
+        closureOutputs.push(noteOffOutput(note, route.channel, oldWireBits));
+        closedKeys.add(route.wireKey);
+      }
+    }
+    from.wireVoices.clear();
+
     state.sink = next;
     const decisions = [];
-    const outputs = [];
+    const outputs = [...closureOutputs];
     const losses = [];
+    const pitchErrors = [];
     const sounding = [...state.notes.values()]
       .filter((n) => n.state === 'sounding')
       .sort((a, b) => a.onOrder - b.onOrder);
     for (const note of sounding) {
       const routed = routeNote(note, { takeover: true });
       note.route = routed.route;
-      decisions.push({ noteId: note.noteId, note: note.note, group: note.group, decision: routed.decision, reason: routed.reason ?? null, wireKey: routed.route.wireKey ?? null });
+      decisions.push({ noteId: note.noteId, note: note.note, group: note.group, decision: routed.decision, reason: routed.reason ?? null, wireKey: routed.route.wireKey ?? null, channel: routed.route.channel ?? null });
       outputs.push(...routed.outputs);
       losses.push(...routed.losses);
       record({ noteId: note.noteId, action: routed.decision, wireKey: routed.route.wireKey ?? null, detail: routed.reason ?? null });
     }
+
+    // Re-apply stored per-note expression on the endpoint that now carries it.
+    if (isNarrow(next.protocol)) {
+      for (const note of sounding) {
+        if (note.route.kind === 'rejected') continue;
+        const expr = state.expression.get(note.noteId);
+        if (!expr) continue;
+        if (expr.perNotePitchBend) {
+          const bendEvent = { group: note.group, channel: note.route.channel, note: note.note, valueUnit: expr.perNotePitchBend.valueUnit, valueRaw: expr.perNotePitchBend.valueRaw };
+          if (isIsolated(note)) {
+            const applied = emitChannelBend(note, bendEvent);
+            outputs.push(...applied.outputs);
+            losses.push(...applied.losses);
+            pitchErrors.push(applied.pitchError);
+            state.deferred.delete(note.noteId);
+          } else if (state.policy.perNoteControl === 'staged-degrade') {
+            if (!state.deferred.has(note.noteId)) state.deferred.set(note.noteId, { event: bendEvent, since: state.onOrder });
+          }
+        }
+        const lastPressure = expr.polyPressure[expr.polyPressure.length - 1];
+        if (lastPressure && note.route.channel != null) {
+          const code = unitToUint(lastPressure.valueUnit, 7);
+          outputs.push(polyPressureMessage(next.protocol, note.group, note.route.channel, note.note, code));
+          state.diagnostics.quantisation({ field: 'polyPressure', valueUnit: lastPressure.valueUnit, bits: 7, noteId: note.noteId, channel: note.route.channel, carrier: controlRule('polyPressure', next.protocol)?.carrier });
+        }
+      }
+      const flush = flushDeferred();
+      outputs.push(...flush.outputs);
+      losses.push(...flush.losses);
+      pitchErrors.push(...flush.pitchErrors);
+    }
+
+    const renegotiation = {
+      protocolChanged: from.protocol !== next.protocol,
+      channelsRemoved,
+      channelCountBefore: from.availableChannels.length,
+      channelCountAfter: next.availableChannels.length,
+    };
     return {
       from: from.protocol,
       to: next.protocol,
       availableChannels: next.availableChannels,
+      renegotiation,
       decisions,
       outputs,
       losses,
+      pitchErrors,
       extraEvents: Math.max(0, outputs.length - sounding.length),
     };
+  }
+
+  // Stamps every output of a result with its loop-guard echo token and a
+  // stable content key, so a peer bridge can recognise its own echo.
+  function stampResult(result) {
+    for (const output of result.outputs ?? []) {
+      const kind = output.description?.split(' ')[0] ?? output.protocol;
+      state.loopGuard.stamp(output, kind, {
+        protocol: output.protocol,
+        group: output.group,
+        hex: output.hex,
+        noteIds: result.noteIds ?? [],
+      });
+    }
+    return result;
+  }
+
+  // Bidirectional entry point. `mark` is the loop-guard token the peer bridge
+  // stamped on the event it converted. An event that is an echo of something
+  // this bridge emitted is dropped once and recorded; new events are handled.
+  function handleFromPeer(event, mark = null) {
+    const payload = { type: event.type, group: event.group, channel: event.channel ?? null, note: event.note ?? null, sourceNoteId: event.sourceNoteId ?? null, valueUnit: event.valueUnit ?? null };
+    if (state.loopGuard.isEcho(event.type, payload, mark)) {
+      state.diagnostics.loop({ action: 'echo-suppressed', type: event.type, note: event.note ?? null });
+      return {
+        input: event, decision: 'loop-echo-suppressed', outputs: [], losses: [], noteIds: [],
+        rejected: true, reason: 'returning echo of an event this bridge already emitted',
+      };
+    }
+    const result = dispatch(event);
+    return stampResult(result);
   }
 
   function snapshot() {
@@ -672,22 +1093,35 @@ export function createBridge({ sink, policy = {} } = {}) {
         foldedInto: n.route.foldedInto ?? null,
       }));
     const wireVoices = [...state.sink.wireVoices.entries()].map(([key, v]) => ({ key, ...v }));
+    const deferred = [...state.deferred.entries()].map(([noteId, item]) => ({
+      noteId, note: state.notes.get(noteId)?.note ?? null,
+      valueUnit: item.event.valueUnit, channel: state.notes.get(noteId)?.route?.channel ?? null,
+    }));
     return {
       sink: state.sink.protocol,
       availableChannels: state.sink.availableChannels,
       sounding,
       wireVoices,
+      deferred,
+      expression: [...state.expression.entries()].map(([noteId, expr]) => ({ noteId, ...expr })),
+      diagnostics: state.diagnostics.all(),
+      diagnosticViolations: state.diagnostics.violations(),
+      loopGuard: state.loopGuard.stats(),
       trace: [...state.trace],
     };
   }
 
   return {
     handle,
+    handleFromPeer,
     setSink,
     snapshot,
     get policy() { return state.policy; },
     setPolicy(patch) { state.policy = { ...state.policy, ...patch }; },
     get sinkProtocol() { return state.sink.protocol; },
     notes: () => state.notes,
+    diagnostics: () => state.diagnostics,
+    loopGuard: () => state.loopGuard,
+    deferred: () => new Map(state.deferred),
   };
 }

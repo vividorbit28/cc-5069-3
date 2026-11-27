@@ -65,6 +65,29 @@
       </fieldset>
 
       <fieldset>
+        <legend>Per-note expression (high-precision identity controls)</legend>
+        <div class="grid3">
+          <label>Target note <input id="expr-note" type="number" min="0" max="127" value="60" /></label>
+          <label>Per-note bend (32-bit) <input id="expr-bend" type="number" min="0" max="4294967295" value="2415919103" /></label>
+          <label>Poly pressure (32-bit) <input id="expr-pressure" type="number" min="0" max="4294967295" value="2147483648" /></label>
+        </div>
+        <label>Per-note control on an identity-less sink
+          <select id="policy-per-note">
+            <option value="drop">Refuse with reason (drop)</option>
+            <option value="channel-approximate">Channel-wide approximation (moves other voices)</option>
+            <option value="migrate-note">Migrate note to a dedicated channel</option>
+            <option value="staged-degrade">Stage until the note can be isolated</option>
+          </select>
+        </label>
+        <div class="row wrap">
+          <button id="btn-per-note-bend">Send per-note pitch bend</button>
+          <button id="btn-poly-pressure">Send poly pressure</button>
+          <button id="btn-compare">Compare migration vs staged</button>
+        </div>
+        <p class="hint">Per-note bend targets the most recent matching sounding note. On a 7-bit sink the bridge either isolates it on its own channel, approximates, defers it, or refuses — never silently drops it.</p>
+      </fieldset>
+
+      <fieldset>
         <legend>Sink (receiver) port</legend>
         <label>Protocol
           <select id="sink-protocol">
@@ -121,6 +144,9 @@
 
       <h2>Precision report</h2>
       <div id="precision" class="precision"></div>
+
+      <h2>Expression degradation &amp; diagnostics</h2>
+      <div id="degradation" class="degradation"></div>
     </section>
   </main>
 

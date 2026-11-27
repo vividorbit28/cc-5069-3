@@ -100,6 +100,7 @@ export function decodeUmp(words, index = 0) {
         : { type: 'noteOff', channel, note: d1, velocity: 0 };
       else if (kind === 0x80) message = { type: 'noteOff', channel, note: d1, velocity: d2 };
       else if (kind === 0xb0) message = { type: 'controlChange', channel, controller: d1, value: d2 };
+      else if (kind === 0xa0) message = { type: 'polyPressure', channel, note: d1, value: d2 };
       else if (kind === 0xe0) message = { type: 'pitchBend', channel, value: (d2 << 7) | d1 };
       else if (kind === 0xd0) message = { type: 'channelPressure', channel, value: d1 };
       else throw reject(`MIDI 1.0 status 0x${kind.toString(16)}`, words, index);
@@ -275,6 +276,9 @@ export function encodeUmp(packet, { group = 0 } = {}) {
     case 'midi1ControlChange':
       return [((0x2 << 28) | g | (((0xb0 | (packet.channel & 0xf)) & 0xff) << 16)
         | ((packet.controller & 0x7f) << 8) | (packet.value & 0x7f)) >>> 0];
+    case 'midi1PolyPressure':
+      return [((0x2 << 28) | g | (((0xa0 | (packet.channel & 0xf)) & 0xff) << 16)
+        | ((packet.note & 0x7f) << 8) | (packet.value & 0x7f)) >>> 0];
     case 'midi1PitchBend': {
       const v = packet.value & 0x3fff;
       return [((0x2 << 28) | g | (((0xe0 | (packet.channel & 0xf)) & 0xff) << 16)

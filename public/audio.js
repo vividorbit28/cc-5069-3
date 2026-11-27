@@ -50,7 +50,34 @@ export function createAudioEngine() {
     gain.gain.exponentialRampToValueAtTime(peak, now + 0.012);
     osc.connect(gain).connect(master);
     osc.start(now);
-    voices.set(key, { osc, gain, startedAt: now });
+    voices.set(key, { osc, gain, startedAt: now, note: msg.note, noteId: msg.noteId, channel: msg.channel, basePeak: peak });
+  }
+
+  // Applies a bend given its signed normalised offset (-1 .. +1 around centre).
+  // A noteId targets a single identity voice (wide per-note bend); otherwise
+  // every voice on the channel bends, so a migrated per-note bend on an
+  // identity-less endpoint is heard exactly where the renderer placed it.
+  function pitchBend(msg, offsetUnit, semitoneRange = 2) {
+    const c = ctx;
+    if (!c) return;
+    const cents = offsetUnit * semitoneRange * 100;
+    for (const v of voices.values()) {
+      if (v.channel !== msg.channel) continue;
+      if (Number.isInteger(msg.noteId) && v.noteId !== msg.noteId) continue;
+      try { v.osc.detune.setTargetAtTime(cents, c.currentTime, 0.01); } catch { /* stopped */ }
+    }
+  }
+
+  // Polyphonic pressure reshapes the loudness of the addressed (channel, note),
+  // given a normalised 0..1 pressure level.
+  function polyPressure(msg, levelUnit) {
+    const c = ctx;
+    if (!c) return;
+    const level = Math.max(0, Math.min(1, levelUnit));
+    for (const v of voices.values()) {
+      if (v.channel !== msg.channel || v.note !== msg.note) continue;
+      try { v.gain.setTargetAtTime(Math.max(0.0005, v.basePeak * (0.35 + 0.65 * level)), c.currentTime, 0.02); } catch { /* stopped */ }
+    }
   }
 
   function noteOff(msg, whenOffset = 0.02) {
@@ -98,6 +125,8 @@ export function createAudioEngine() {
   return {
     noteOn,
     noteOff,
+    pitchBend,
+    polyPressure,
     closePort,
     allOff,
     setMuted(v) { muted = v; if (v) allOff(); },

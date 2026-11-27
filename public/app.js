@@ -11,6 +11,8 @@ import { eventFromUmp } from '/src/core/internal.js';
 import { createBridge } from '/src/core/bridge.js';
 import { createRenderer } from '/src/core/render.js';
 import { uintToUnit, compareLevel, maxForBits, policySummary, PROTOCOLS } from '/src/core/precision.js';
+import { degradationCatalogue, DISPOSITION } from '/src/core/degradation.js';
+import { compareDegradationStrategies } from '/src/core/comparison.js';
 import {
   duplicateNoteFixture, boundaryAndGroupsFixture, crossGroupSameNoteFixture, mixedUnsupportedFixture,
 } from '/src/core/fixtures.js';
@@ -24,6 +26,7 @@ const el = {
   timeline: $('timeline'),
   wire: $('wire-out'),
   precision: $('precision'),
+  degradation: $('degradation'),
   policyLine: $('policy-line'),
   velReadout: $('vel-readout'),
   ccReadout: $('cc-readout'),
@@ -47,6 +50,7 @@ function sinkConfig() {
     policy: {
       noteConflict: $('policy-note-conflict').value,
       controlResolution: $('policy-control').value,
+      perNoteControl: $('policy-per-note').value,
     },
   };
 }
@@ -63,6 +67,7 @@ function ensureBridge(force = false) {
     el.wire.textContent = '';
     el.timeline.innerHTML = '';
     el.precision.innerHTML = '';
+    el.degradation.innerHTML = '';
     audio.allOff();
   }
   return bridge;
@@ -134,6 +139,13 @@ function processEvent(ev, label) {
   return result;
 }
 
+function bendOffset(msg) {
+  // Signed normalised offset around centre for the field width the sink used.
+  const wide = msg.port === 'ump-midi2';
+  const max = wide ? 4294967295 : 16383;
+  return (msg.value / max) * 2 - 1;
+}
+
 function emitAudio(result) {
   for (const output of result.outputs) {
     if (output.encoding === 'ump') {
@@ -144,6 +156,11 @@ function emitAudio(result) {
         audio.noteOn(msg, level);
       } else if (msg.type === 'noteOff') {
         audio.noteOff(msg);
+      } else if (msg.type === 'pitchBend' || msg.type === 'perNotePitchBend') {
+        audio.pitchBend(msg, bendOffset(msg));
+      } else if (msg.type === 'polyPressure') {
+        const max = msg.port === 'ump-midi2' ? 4294967295 : 127;
+        audio.polyPressure(msg, msg.value / max);
       }
     } else if (output.encoding === 'midi1-bytes') {
       const b = output.bytes;
@@ -151,6 +168,8 @@ function emitAudio(result) {
       const channel = b[0] & 0x0f;
       if (kind === 0x90 && b[2] > 0) audio.noteOn({ group: output.group, port: output.protocol, channel, note: b[1], velocity: b[2] }, b[2] / 127);
       else if (kind === 0x80 || (kind === 0x90 && b[2] === 0)) audio.noteOff({ group: output.group, port: output.protocol, channel, note: b[1] });
+      else if (kind === 0xe0) audio.pitchBend({ group: output.group, port: output.protocol, channel }, (((b[2] << 7) | b[1]) / 16383) * 2 - 1);
+      else if (kind === 0xa0) audio.polyPressure({ group: output.group, port: output.protocol, channel, note: b[1] }, b[2] / 127);
     }
   }
 }
@@ -189,6 +208,67 @@ function recordWire(outputs) {
 function renderAll() {
   renderTimeline();
   renderPrecision();
+  renderDegradation();
+}
+
+// Renders which class of expression was lost, deferred, approximated or merely
+// quantised, plus the stored quantisation / merge / loop diagnostics. Every row
+// comes from the bridge's real diagnostic store, not a static fixture.
+function renderDegradation() {
+  if (!bridge) return;
+  const snap = bridge.snapshot();
+  const diag = bridge.diagnostics();
+  const rows = [];
+
+  const dispositionLabel = (d) => ({
+    [DISPOSITION.CHANNEL]: 'channel carrier (quantised)',
+    [DISPOSITION.APPROXIMATE]: 'approximation — moves other voices',
+    [DISPOSITION.EXTRA_CHANNEL]: 'extra channel required',
+    [DISPOSITION.REFUSE]: 'refused — reason preserved',
+  })[d] ?? d;
+
+  rows.push('<div class="diag-block"><h3>Loss ledger (this session)</h3>');
+  const losses = snap.diagnostics.filter((d) => d.kind === 'quantisation' || d.kind === 'refusal' || d.kind === 'deferred-expression' || d.kind === 'state-merge' || d.kind === 'loop-guard' || d.kind === 'migration');
+  if (!losses.length) {
+    rows.push('<p class="hint">No degradation recorded yet.</p>');
+  } else {
+    rows.push('<table><thead><tr><th>kind</th><th>field</th><th>detail</th><th>class</th></tr></thead><tbody>');
+    for (const d of losses.slice(-40)) {
+      let detail;
+      let cls = '';
+      if (d.kind === 'quantisation') detail = `${d.bits}-bit code ${d.code}/${d.maxCode}, err ${d.error.toExponential(2)}`;
+      else if (d.kind === 'state-merge') detail = `${d.distinctInputs} inputs -> code ${d.code}, spread ${d.inputSpread.toExponential(2)}`;
+      else if (d.kind === 'refusal') { detail = d.reason; cls = 'loss-destructive'; }
+      else if (d.kind === 'deferred-expression') { detail = `withheld bend ${d.valueUnit.toFixed(4)}`; cls = 'loss-approx'; }
+      else if (d.kind === 'migration') detail = `ch${d.fromChannel} -> ch${d.toChannel}: ${d.reason}`;
+      else if (d.kind === 'loop-guard') detail = d.action;
+      const disposition = d.violations?.length ? 'rule violation' : (cls ? dispositionLabel(cls === 'loss-destructive' ? DISPOSITION.REFUSE : DISPOSITION.APPROXIMATE) : 'quantisable');
+      rows.push(`<tr class="${cls}"><td>${d.kind}</td><td>${d.field ?? '—'}</td><td>${detail ?? '—'}</td><td>${d.kind === 'quantisation' || d.kind === 'state-merge' ? 'quantisable' : disposition}</td></tr>`);
+    }
+    rows.push('</tbody></table>');
+  }
+  rows.push('</div>');
+
+  rows.push('<div class="diag-block"><h3>Deferred per-note expression</h3>');
+  if (!snap.deferred.length) rows.push('<p class="hint">Nothing held back.</p>');
+  else {
+    rows.push('<table><thead><tr><th>note</th><th>channel</th><th>intended bend unit</th></tr></thead><tbody>');
+    for (const d of snap.deferred) rows.push(`<tr><td>${d.note}</td><td>${d.channel ?? '—'}</td><td>${d.valueUnit.toFixed(6)}</td></tr>`);
+    rows.push('</tbody></table>');
+  }
+  rows.push('</div>');
+
+  rows.push('<div class="diag-block"><h3>Endpoint capability (static matrix)</h3>');
+  rows.push('<table><thead><tr><th>control</th><th>endpoint</th><th>carrier</th><th>disposition</th></tr></thead><tbody>');
+  for (const c of degradationCatalogue()) {
+    rows.push(`<tr><td>${c.type}${c.perNote ? ' *' : ''}</td><td>${c.endpoint}</td><td>${c.carrier} (${c.bits}bit)</td><td>${c.staticDisposition ?? 'live: extra-channel / approximate / refuse'}</td></tr>`);
+  }
+  rows.push('</tbody></table><p class="hint">* per-note control. No information is hidden in private fields the endpoint cannot parse.</p></div>');
+
+  const violations = diag.violations();
+  rows.push(`<p class="hint ${violations.length ? 'loss-destructive' : ''}">Diagnostic rule check: ${violations.length ? violations.length + ' violation(s)' : 'endpoint and monotonicity rules hold'} · loop guard: ${snap.loopGuard.totalStamped} stamped, ${snap.loopGuard.pendingEchoes} pending echoes</p>`);
+
+  el.degradation.innerHTML = rows.join('');
 }
 
 function slimVoice(v) {
@@ -333,6 +413,71 @@ function sendBend() {
   processEvent(eventFromUmp(group, events[0].message), `pitch bend = ${value}/${maxForBits(32)}`);
 }
 
+// Resolves the most recent matching sounding note so the per-note event carries
+// the same source identity the bridge allocated on its Note On.
+function targetSoundingNote(noteNumber) {
+  const snap = bridge?.snapshot();
+  if (!snap) return null;
+  const matches = snap.sounding.filter((s) => s.note === noteNumber);
+  return matches[matches.length - 1] ?? null;
+}
+
+function sendPerNoteBend() {
+  const group = 0;
+  const channel = Number.parseInt($('note-channel').value, 10) || 0;
+  const note = Math.max(0, Math.min(127, Number.parseInt($('expr-note').value, 10) || 60));
+  const value = Math.max(0, Math.min(0xffffffff, Number($('expr-bend').value)) >>> 0);
+  const target = targetSoundingNote(note);
+  if (!target) { showAlert('no sounding note matches the per-note bend target', 'warn'); return; }
+  const packet = { type: 'perNotePitchBend', channel, note, value };
+  if (target.sourceNoteId != null) packet.noteId = target.sourceNoteId;
+  const words = encodeUmp(packet, { group });
+  const { events, errors } = decodeUmpStream(words);
+  if (errors.length) { showAlert(`decode rejected our own message: ${errors[0].message}`); return; }
+  const result = processEvent(eventFromUmp(events[0].group, events[0].message), `per-note bend n${note} = ${value}`);
+  if (result?.pitchErrors?.length) {
+    const e = result.pitchErrors[0];
+    showAlert(`bend delivered on ch${e.channel ?? '?'}: ${e.centsError.toFixed(3)} cents error at ${e.bits}-bit`, 'warn');
+  }
+}
+
+function sendPolyPressure() {
+  const group = 0;
+  const channel = Number.parseInt($('note-channel').value, 10) || 0;
+  const note = Math.max(0, Math.min(127, Number.parseInt($('expr-note').value, 10) || 60));
+  const value = Math.max(0, Math.min(0xffffffff, Number($('expr-pressure').value)) >>> 0);
+  const target = targetSoundingNote(note);
+  if (!target) { showAlert('no sounding note matches the poly pressure target', 'warn'); return; }
+  const packet = { type: 'polyPressure', channel, note, value };
+  if (target.sourceNoteId != null) packet.noteId = target.sourceNoteId;
+  const words = encodeUmp(packet, { group });
+  const { events } = decodeUmpStream(words);
+  processEvent(eventFromUmp(events[0].group, events[0].message), `poly pressure n${note} = ${value}`);
+}
+
+// Runs the real two-strategy comparison engine and renders its measured table.
+function runComparison() {
+  const channels = sinkConfig().availableChannels;
+  const bendUnit = (Number($('expr-bend').value) >>> 0) / maxForBits(32);
+  const r = compareDegradationStrategies({ channels, bendUnit });
+  const box = document.createElement('div');
+  box.className = 'compare-box';
+  const title = document.createElement('h3');
+  title.textContent = `migrate-note vs staged-degrade (bend ${bendUnit.toFixed(4)}, channels [${channels.join(',')}])`;
+  box.appendChild(title);
+  const table = document.createElement('table');
+  table.innerHTML = '<thead><tr><th>axis</th><th>migrate-note</th><th>staged-degrade</th></tr></thead><tbody></tbody>';
+  const body = table.querySelector('tbody');
+  for (const row of r.contrast) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${row.axis}</td><td>${row.migrateNote}</td><td>${row.stagedDegrade}</td>`;
+    body.appendChild(tr);
+  }
+  box.appendChild(table);
+  el.degradation.prepend(box);
+  showAlert('strategy comparison rendered from the shared bridge + renderer engine', 'warn');
+}
+
 function applySink() {
   const b = ensureBridge();
   const cfg = sinkConfig();
@@ -343,16 +488,7 @@ function applySink() {
   renderer.closePort(switched.from, clock);
   audio.closePort(switched.from);
   renderer.feed(clock, cfg.protocol, switched.outputs);
-  for (const o of switched.outputs) {
-    if (o.encoding === 'ump') {
-      const { message } = decodeUmpStream(o.words);
-      const msg = { ...message, group: o.group, port: o.protocol };
-      if (msg.type === 'noteOn') audio.noteOn(msg, msg.port === 'ump-midi2' ? msg.velocity / 65535 : msg.velocity / 127);
-    } else if (o.encoding === 'midi1-bytes') {
-      const by = o.bytes;
-      if ((by[0] & 0xf0) === 0x90 && by[2] > 0) audio.noteOn({ group: o.group, port: o.protocol, channel: by[0] & 0xf, note: by[1], velocity: by[2] }, by[2] / 127);
-    }
-  }
+  emitAudio({ outputs: switched.outputs });
   recordWire(switched.outputs);
   const li = document.createElement('li');
   const tag = document.createElement('span');
@@ -442,6 +578,9 @@ function init() {
   $('btn-cc').addEventListener('click', sendController);
   $('btn-sweep').addEventListener('click', sendSweep);
   $('btn-bend').addEventListener('click', sendBend);
+  $('btn-per-note-bend').addEventListener('click', sendPerNoteBend);
+  $('btn-poly-pressure').addEventListener('click', sendPolyPressure);
+  $('btn-compare').addEventListener('click', runComparison);
   $('btn-apply-sink').addEventListener('click', applySink);
   $('btn-clear').addEventListener('click', () => { el.log.innerHTML = ''; el.wire.textContent = ''; wireLines = []; });
   $('btn-reset').addEventListener('click', reset);
